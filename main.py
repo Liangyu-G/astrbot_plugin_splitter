@@ -1,3 +1,4 @@
+# astrbot_plugin_splitter
 import re
 import math
 import random
@@ -20,10 +21,34 @@ class MessageSplitterPlugin(Star):
             '[': ']', '{': '}', "'": "'", '【': '】', '<': '>'
         }
         self.quote_chars = {'"', "'", "`"}
+        
+        # 用于记录 LLM 回复和 Tool Call 的 msg_id，防止内存泄漏限制长度为 100
+        self.llm_reply_msgs: List[str] = []
+        self.tool_call_msgs: List[str] = []
+
+    def _record_msg_id(self, lst: List[str], msg_id: str):
+        if msg_id not in lst:
+            lst.append(msg_id)
+            if len(lst) > 100:
+                lst.pop(0)
 
     @filter.on_llm_response()
     async def on_llm_response(self, event: AstrMessageEvent, resp: LLMResponse):
         setattr(event, "__is_llm_reply", True)
+        
+        if hasattr(event, 'message_obj') and event.message_obj:
+            msg_id = str(event.message_obj.message_id)
+            self._record_msg_id(self.llm_reply_msgs, msg_id)
+            
+            # 检查是否包含工具调用 (兼容常见的 LLMResponse 结构)
+            is_tool_call = False
+            for attr in ['tools', 'tool_calls', 'function_call']:
+                if hasattr(resp, attr) and getattr(resp, attr):
+                    is_tool_call = True
+                    break
+            
+            if is_tool_call:
+                self._record_msg_id(self.tool_call_msgs, msg_id)
 
     @filter.on_decorating_result(priority=-100000000000000000)
     async def on_decorating_result(self, event: AstrMessageEvent):
@@ -35,9 +60,15 @@ class MessageSplitterPlugin(Star):
         if not result or not result.chain:
             return
 
+        msg_id = str(event.message_obj.message_id) if hasattr(event, 'message_obj') and event.message_obj else ""
+
         # 2. 作用范围检查
         split_scope = self.config.get("split_scope", "llm_only")
         is_llm_reply = getattr(event, "__is_llm_reply", False)
+        
+        # 辅助判断：如果 event 丢失了属性，通过 msg_id 找回
+        if msg_id and msg_id in self.llm_reply_msgs:
+            is_llm_reply = True
 
         if split_scope == "llm_only" and not is_llm_reply:
             return
@@ -97,8 +128,6 @@ class MessageSplitterPlugin(Star):
 
         logger.info(f"[Splitter] 消息被分为 {len(segments)} 段。")
 
-        # 8. 逐段处理
-        
         # 先应用清理正则到所有段落
         if clean_pattern:
             for seg in segments:
@@ -106,51 +135,71 @@ class MessageSplitterPlugin(Star):
                     if isinstance(comp, Plain) and comp.text:
                         comp.text = re.sub(clean_pattern, "", comp.text)
 
-        # 发送前 N-1 段
-        for i in range(len(segments) - 1):
-            segment_chain = segments[i]
-            
-            # 空内容检查
-            text_content = "".join([c.text for c in segment_chain if isinstance(c, Plain)])
-            has_media = any(not isinstance(c, Plain) for c in segment_chain)
-            if not text_content.strip() and not has_media:
-                continue
+        # 判断是否为 Tool Call 的前置文字
+        is_tool_call_prefix = msg_id and msg_id in self.tool_call_msgs
 
-            try:
-                # --- 处理TTS ---
-                segment_chain = await self._process_tts_for_segment(event, segment_chain)
-                # ---------------
+        # 8. 逐段处理发送
+        if is_tool_call_prefix:
+            # 【新逻辑】如果是 Tool Call 提前发送的文字：全部主动发送，不需要交给框架
+            for i in range(len(segments)):
+                segment_chain = segments[i]
                 
-                # --- 日志输出 ---
-                self._log_segment(i + 1, len(segments), segment_chain, "主动发送")
-                # ---------------
+                text_content = "".join([c.text for c in segment_chain if isinstance(c, Plain)])
+                has_media = any(not isinstance(c, Plain) for c in segment_chain)
+                if not text_content.strip() and not has_media:
+                    continue
 
-                mc = MessageChain()
-                mc.chain = segment_chain
-                await self.context.send_message(event.unified_msg_origin, mc)
+                try:
+                    segment_chain = await self._process_tts_for_segment(event, segment_chain)
+                    self._log_segment(i + 1, len(segments), segment_chain, "主动发送(Tool前置)")
 
-                # 延迟
-                wait_time = self.calculate_delay(text_content)
-                await asyncio.sleep(wait_time)
+                    mc = MessageChain()
+                    mc.chain = segment_chain
+                    await self.context.send_message(event.unified_msg_origin, mc)
 
-            except Exception as e:
-                logger.error(f"[Splitter] 发送分段 {i+1} 失败: {e}")
-
-        # 9. 处理最后一段
-        last_segment = segments[-1]
-        
-        last_text = "".join([c.text for c in last_segment if isinstance(c, Plain)])
-        last_has_media = any(not isinstance(c, Plain) for c in last_segment)
-        
-        if not last_text.strip() and not last_has_media:
-            result.chain.clear() 
-        else:
-            # --- 日志输出 ---
-            self._log_segment(len(segments), len(segments), last_segment, "交给框架")
-            # ---------------
+                    if i < len(segments) - 1:
+                        wait_time = self.calculate_delay(text_content)
+                        await asyncio.sleep(wait_time)
+                except Exception as e:
+                    logger.error(f"[Splitter] 发送 Tool 前置分段 {i+1} 失败: {e}")
             
+            # 清空框架的 chain，阻止框架发送
             result.chain.clear()
-            result.chain.extend(last_segment)
+            
+        else:
+            # 【原有逻辑】普通回复：发送前 N-1 段，最后一段交给框架
+            for i in range(len(segments) - 1):
+                segment_chain = segments[i]
+                
+                text_content = "".join([c.text for c in segment_chain if isinstance(c, Plain)])
+                has_media = any(not isinstance(c, Plain) for c in segment_chain)
+                if not text_content.strip() and not has_media:
+                    continue
+
+                try:
+                    segment_chain = await self._process_tts_for_segment(event, segment_chain)
+                    self._log_segment(i + 1, len(segments), segment_chain, "主动发送")
+
+                    mc = MessageChain()
+                    mc.chain = segment_chain
+                    await self.context.send_message(event.unified_msg_origin, mc)
+
+                    wait_time = self.calculate_delay(text_content)
+                    await asyncio.sleep(wait_time)
+                except Exception as e:
+                    logger.error(f"[Splitter] 发送分段 {i+1} 失败: {e}")
+
+            # 处理最后一段交给框架
+            last_segment = segments[-1]
+            last_text = "".join([c.text for c in last_segment if isinstance(c, Plain)])
+            last_has_media = any(not isinstance(c, Plain) for c in last_segment)
+            
+            if not last_text.strip() and not last_has_media:
+                result.chain.clear() 
+            else:
+                self._log_segment(len(segments), len(segments), last_segment, "交给框架")
+                result.chain.clear()
+                result.chain.extend(last_segment)
 
     def _log_segment(self, index: int, total: int, chain: List[BaseMessageComponent], method: str):
         """输出单行段落内容日志"""
@@ -161,20 +210,16 @@ class MessageSplitterPlugin(Star):
             else:
                 content_str += f"[{type(comp).__name__}]"
         
-        # 替换换行符以便在单行日志中显示，如果需要完全原始输出可去掉 replace
         log_content = content_str.replace('\n', '\\n')
         logger.info(f"[Splitter] 第 {index}/{total} 段 ({method}): {log_content}")
 
     async def _process_tts_for_segment(self, event: AstrMessageEvent, segment: List[BaseMessageComponent]) -> List[BaseMessageComponent]:
         """为分段处理TTS（如果启用）"""
-        # 检查是否启用分段TTS
         enable_tts_for_segments = self.config.get("enable_tts_for_segments", True)
         if not enable_tts_for_segments:
             return segment
         
-        # 获取框架TTS配置
         try:
-            # 使用和框架相同的逻辑检查TTS是否应该启用
             all_config = self.context.get_config(event.unified_msg_origin)
             tts_config = all_config.get("provider_tts_settings", {})
             tts_enabled = tts_config.get("enable", False)
@@ -182,12 +227,10 @@ class MessageSplitterPlugin(Star):
             if not tts_enabled:
                 return segment
             
-            # 获取TTS provider
             tts_provider = self.context.get_using_tts_provider(event.unified_msg_origin)
             if not tts_provider:
                 return segment
             
-            # 检查是否应该处理TTS（会话级别和LLM结果检查）
             result = event.get_result()
             if not result or not result.is_llm_result():
                 return segment
@@ -195,7 +238,6 @@ class MessageSplitterPlugin(Star):
             if not await SessionServiceManager.should_process_tts_request(event):
                 return segment
             
-            # 检查触发概率
             tts_trigger_probability = tts_config.get("trigger_probability", 1.0)
             try:
                 tts_trigger_probability = max(0.0, min(float(tts_trigger_probability), 1.0))
@@ -205,10 +247,8 @@ class MessageSplitterPlugin(Star):
             if random.random() > tts_trigger_probability:
                 return segment
             
-            # 获取其他TTS配置
             dual_output = tts_config.get("dual_output", False)
             
-            # 处理segment中的每个Plain组件
             new_segment = []
             for comp in segment:
                 if isinstance(comp, Plain) and len(comp.text) > 1:
@@ -218,9 +258,7 @@ class MessageSplitterPlugin(Star):
                         logger.info(f"[Splitter] TTS 结果: {audio_path}")
                         
                         if audio_path:
-                            # 创建Record组件
                             new_segment.append(Record(file=audio_path, url=audio_path))
-                            # 如果启用双重输出，也添加文本
                             if dual_output:
                                 new_segment.append(comp)
                         else:
@@ -306,37 +344,4 @@ class MessageSplitterPlugin(Star):
                 buffer.append(Plain(part))
         if temp_text: buffer.append(Plain(temp_text))
 
-    def _process_text_smart(self, text: str, pattern: str, segments: list, buffer: list):
-        stack = []
-        compiled_pattern = re.compile(pattern)
-        i = 0
-        n = len(text)
-        current_chunk = ""
-
-        while i < n:
-            char = text[i]
-            is_opener = char in self.pair_map
-            if char in self.quote_chars:
-                if stack and stack[-1] == char: stack.pop()
-                else: stack.append(char)
-                current_chunk += char; i += 1; continue
-            if stack:
-                expected_closer = self.pair_map.get(stack[-1])
-                if char == expected_closer: stack.pop()
-                elif is_opener: stack.append(char)
-                current_chunk += char; i += 1; continue
-            if is_opener:
-                stack.append(char); current_chunk += char; i += 1; continue
-
-            match = compiled_pattern.match(text, pos=i)
-            if match:
-                delimiter = match.group()
-                current_chunk += delimiter
-                buffer.append(Plain(current_chunk))
-                segments.append(buffer[:])
-                buffer.clear()
-                current_chunk = ""
-                i += len(delimiter)
-            else:
-                current_chunk += char; i += 1
-        if current_chunk: buffer.append(Plain(current_chunk))
+    def _process_text_smart(self, text: str, pattern
