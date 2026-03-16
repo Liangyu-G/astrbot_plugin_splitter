@@ -33,6 +33,28 @@
     "type": "int",
     "default": 0
   },
+  "balanced_split_mode": {
+    "description": "智能均分模式",
+    "hint": "开启后，会自动用总字数除以最大分段数，尽量让每段字数均匀分布。",
+    "type": "bool",
+    "default": false
+  },
+"min_segment_length": {
+    "description": "均分时的最小段落长度",
+    "hint": "防止均分时切出只有几个字的碎片，建议设置 10-20。",
+    "type": "int",
+    "default": 10
+  },
+  "balanced_split_ratio_min": {
+    "description": "均分模式下，低于理想长度的该比例时不切分",
+    "type": "float",
+    "default": 0.4
+  },
+  "balanced_split_ratio_max": {
+    "description": "均分模式下，高于理想长度的该比例时寻找次级标点切分",
+    "type": "float",
+    "default": 0.9
+  },
   "enable_smart_split": {
     "description": "是否开启智能识别(忽略引号内标点)。",
     "type": "bool",

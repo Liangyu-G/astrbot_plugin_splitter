@@ -25,6 +25,18 @@ class MessageSplitterPlugin(Star):
         # 定义引用/引号字符
         self.quote_chars = {'"', "'", "`"}
 
+        self.balanced_mode = self.config.get("balanced_split_mode", False)
+        try:
+            self.min_seg_length = max(int(self.config.get("min_segment_length", 10)), 1)
+            self.split_ratio_min = float(self.config.get("balanced_split_ratio_min", 0.4))
+            self.split_ratio_max = float(self.config.get("balanced_split_ratio_max", 0.9))
+        except (ValueError, TypeError):
+            self.min_seg_length = 10
+            self.split_ratio_min = 0.4
+            self.split_ratio_max = 0.9
+            
+        self.secondary_pattern = re.compile(r'[，,、；;]+')
+
     @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
         """
@@ -97,8 +109,47 @@ class MessageSplitterPlugin(Star):
             'default': self.config.get("other_media_strategy", "跟随下段")
         }
 
+        ideal_length = 0
+        if self.balanced_mode and max_segs > 0:
+            text_weight = sum(len(c.text.replace(" ", "")) for c in result.chain if isinstance(c, Plain))
+            
+            solo_media_count = 0
+            for c in result.chain:
+                if not isinstance(c, Plain) and not isinstance(c, Reply):
+                    c_type = type(c).__name__.lower()
+                    if 'image' in c_type and strategies.get('image', '单独') == "单独":
+                        solo_media_count += 1
+                    elif 'at' in c_type and strategies.get('at', '跟随下段') == "单独":
+                        solo_media_count += 1
+                    elif 'face' in c_type and strategies.get('face', '嵌入') == "单独":
+                        solo_media_count += 1
+                    elif 'image' not in c_type and 'at' not in c_type and 'face' not in c_type and strategies.get('default', '跟随下段') == "单独":
+                        solo_media_count += 1
+            
+            target_text_segs = max(1, max_segs - solo_media_count)
+            
+            if text_weight > 0:
+                ideal_length = max(math.ceil(text_weight / target_text_segs), self.min_seg_length)
+                if text_weight < ideal_length * 1.2:
+                    ideal_length = 0
+
         # 5. 执行切分：将原始消息链分解为多个子链（segments）
-        segments = self.split_chain_smart(result.chain, split_pattern, smart_mode, strategies, enable_reply)
+        segments = self.split_chain_smart(
+            result.chain, 
+            split_pattern, 
+            smart_mode, 
+            strategies, 
+            enable_reply,
+            ideal_length
+        )
+
+        if self.balanced_mode and len(segments) >= 2:
+            last_seg_text = "".join([c.text for c in segments[-1] if isinstance(c, Plain)]).replace(" ", "")
+            if 0 < len(last_seg_text) < self.min_seg_length:
+                last_has_media = any(not isinstance(c, Plain) and not isinstance(c, Reply) for c in segments[-1])
+                if not last_has_media:
+                    short_tail = segments.pop()
+                    segments[-1].extend(short_tail)
 
         # 6. 最大分段数限制：如果段数过多，则强行合并最后几段，避免消息轰炸
         if len(segments) > max_segs and max_segs > 0:
@@ -303,12 +354,13 @@ class MessageSplitterPlugin(Star):
         else:
             return self.config.get("fixed_delay", 1.5)
 
-    def split_chain_smart(self, chain: List[BaseMessageComponent], pattern: str, smart_mode: bool, strategies: Dict[str, str], enable_reply: bool) -> List[List[BaseMessageComponent]]:
+    def split_chain_smart(self, chain: List[BaseMessageComponent], pattern: str, smart_mode: bool, strategies: Dict[str, str], enable_reply: bool, ideal_length: int = 0) -> List[List[BaseMessageComponent]]:
         """
         智能分段核心逻辑：遍历消息组件链，根据组件类型和文本内容进行分段。
         """
         segments = []
         current_chain_buffer = []
+        current_chain_weight = 0
 
         for component in chain:
             if isinstance(component, Plain):
@@ -317,8 +369,11 @@ class MessageSplitterPlugin(Star):
                 if not text: continue
                 if not smart_mode:
                     self._process_text_simple(text, pattern, segments, current_chain_buffer)
+                    current_chain_weight = 0
                 else:
-                    self._process_text_smart(text, pattern, segments, current_chain_buffer)
+                    current_chain_weight = self._process_text_smart(
+                        text, pattern, segments, current_chain_buffer, current_chain_weight, ideal_length
+                    )
             else:
                 # 非文本组件（如图片、表情等）
                 c_type = type(component).__name__.lower()
@@ -340,12 +395,14 @@ class MessageSplitterPlugin(Star):
                         segments.append(current_chain_buffer[:])
                         current_chain_buffer.clear()
                     segments.append([component])
+                    current_chain_weight = 0
                 elif strategy == "跟随上段":
                     # 加入当前缓冲区后立即打包分段
                     if current_chain_buffer:
                         current_chain_buffer.append(component)
                         segments.append(current_chain_buffer[:])
                         current_chain_buffer.clear()
+                        current_chain_weight = 0
                     elif segments:
                         segments[-1].append(component)
                     else:
@@ -355,6 +412,7 @@ class MessageSplitterPlugin(Star):
                     if current_chain_buffer:
                         segments.append(current_chain_buffer[:])
                         current_chain_buffer.clear()
+                        current_chain_weight = 0
                     current_chain_buffer.append(component)
                 else: 
                     # 嵌入模式：直接加入缓冲区，等待自然切分
@@ -379,22 +437,23 @@ class MessageSplitterPlugin(Star):
                 buffer.clear()
                 temp_text = ""
             else:
-                if temp_text: buffer.append(Plain(temp_text)); temp_text = ""
-                buffer.append(Plain(part))
-        if temp_text: buffer.append(Plain(temp_text))
+                temp_text += part
+        if temp_text:
+            buffer.append(Plain(temp_text))
 
-    def _process_text_smart(self, text: str, pattern: str, segments: list, buffer: list):
+    def _process_text_smart(self, text: str, pattern: str, segments: list, buffer: list, start_weight: int = 0, ideal_length: int = 0) -> int:
         """
         智能文本切分逻辑：
         1. 保护代码块（```）。
         2. 保护成对符号（括号、引号）不被中途切断。
-        3. 保护英文上下文及数字（防止如 "1.5" 或 "Wait..." 被切开）。
+        3. 保护英文上下文及数字。
         """
         stack = [] # 符号栈，用于追踪嵌套
         compiled_pattern = re.compile(pattern)
         i = 0
         n = len(text)
         current_chunk = ""
+        current_weight = start_weight
 
         while i < n:
             # 1. 代码块保护：检测到 ``` 则跳过到结束标识，视为一个整体
@@ -402,10 +461,12 @@ class MessageSplitterPlugin(Star):
                 next_idx = text.find("```", i + 3)
                 if next_idx != -1:
                     current_chunk += text[i:next_idx+3]
+                    current_weight += (next_idx + 3 - i)
                     i = next_idx + 3
                     continue
                 else:
                     current_chunk += text[i:]
+                    current_weight += (n - i)
                     break
 
             char = text[i]
@@ -418,6 +479,7 @@ class MessageSplitterPlugin(Star):
                 else: 
                     stack.append(char) # 引号开启
                 current_chunk += char
+                if not char.isspace(): current_weight += 1
                 i += 1
                 continue
             
@@ -430,8 +492,11 @@ class MessageSplitterPlugin(Star):
                     stack.append(char) # 嵌套开启
                 
                 # 符号内部的换行符替换为空格，保持块的完整性
-                if char == '\n': current_chunk += ' '
-                else: current_chunk += char
+                if char == '\n': 
+                    current_chunk += ' '
+                else: 
+                    current_chunk += char
+                    if not char.isspace(): current_weight += 1
                 i += 1
                 continue
                 
@@ -439,6 +504,7 @@ class MessageSplitterPlugin(Star):
             if is_opener:
                 stack.append(char)
                 current_chunk += char
+                if not char.isspace(): current_weight += 1
                 i += 1
                 continue
 
@@ -446,6 +512,11 @@ class MessageSplitterPlugin(Star):
             match = compiled_pattern.match(text, pos=i)
             if match:
                 delimiter = match.group()
+                should_split = True
+                
+                if ideal_length > 0 and current_weight < ideal_length * self.split_ratio_min:
+                    should_split = False
+
                 prev_char = text[i-1] if i > 0 else ""
                 next_char = text[i+len(delimiter)] if i+len(delimiter) < n else ""
                 
@@ -457,6 +528,7 @@ class MessageSplitterPlugin(Star):
                         next_is_en = (not next_char) or bool(re.match(r'^[a-zA-Z0-9 \t.?!,;:\-\']$', next_char))
                         if prev_is_en and next_is_en:
                             current_chunk += delimiter
+                            current_weight += len(delimiter)
                             i += len(delimiter)
                             continue
                             
@@ -464,20 +536,54 @@ class MessageSplitterPlugin(Star):
                     if bool(re.match(r'^[ \t.?!]+$', delimiter)):
                         if '.' in delimiter and bool(re.match(r'^\d$', prev_char)) and bool(re.match(r'^\d$', next_char)):
                             current_chunk += delimiter
+                            current_weight += len(delimiter)
                             i += len(delimiter)
                             continue
 
-                # 满足切分条件：将当前块推入缓冲区并打包分段
-                current_chunk += delimiter
-                buffer.append(Plain(current_chunk))
-                segments.append(buffer[:])
-                buffer.clear()
-                current_chunk = ""
-                i += len(delimiter)
-            else:
-                # 常规字符累加
-                current_chunk += char
-                i += 1
-                
-        if current_chunk: 
+                if should_split:
+                    # 满足切分条件：将当前块推入缓冲区并打包分段
+                    current_chunk += delimiter
+                    buffer.append(Plain(current_chunk))
+                    segments.append(buffer[:])
+                    buffer.clear()
+                    current_chunk = ""
+                    current_weight = 0
+                    i += len(delimiter)
+                else:
+                    current_chunk += delimiter
+                    current_weight += len(delimiter)
+                    i += len(delimiter)
+                continue
+            
+            elif ideal_length > 0 and current_weight >= ideal_length * self.split_ratio_max:
+                sec_match = self.secondary_pattern.match(text, pos=i)
+                if sec_match:
+                    delimiter = sec_match.group()
+                    is_protected = False
+
+                    if delimiter.strip() in [",", "，", ".", "。"]:
+                        prev_char = text[i - 1] if i > 0 else ""
+                        next_char = text[i + len(delimiter)] if i + len(delimiter) < n else ""
+                        if bool(re.match(r'[a-zA-Z0-9]', prev_char)) and bool(re.match(r'[a-zA-Z0-9]', next_char)):
+                            is_protected = True
+
+                    if not is_protected:
+                        current_chunk += delimiter
+                        buffer.append(Plain(current_chunk))
+                        segments.append(buffer[:])
+                        buffer.clear()
+                        current_chunk = ""
+                        current_weight = 0
+                        i += len(delimiter)
+                        continue
+
+            # 常规字符累加
+            current_chunk += char
+            if not char.isspace():
+                current_weight += 1
+            i += 1
+
+        if current_chunk:
             buffer.append(Plain(current_chunk))
+
+        return current_weight
