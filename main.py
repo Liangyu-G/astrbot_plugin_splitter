@@ -12,7 +12,6 @@ from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api.message_components import Plain, BaseMessageComponent, Reply, Record
 from astrbot.core.star.session_llm_manager import SessionServiceManager
 
-@register("message_splitter", "AstrBot", "1.0.0", "消息分段发送插件")
 class MessageSplitterPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -85,6 +84,16 @@ class MessageSplitterPlugin(Star):
 
         # 标记为已由分段器处理
         setattr(event, "__splitter_processed", True)
+
+        # === 兼容性处理：脱敏其他插件(如AtTool)注入的零宽字符及附带空格 ===
+        # 将其替换为无空格的占位符，避免被带 \s 的分段正则无情切碎导致换行断层
+        has_external_at_processing = False
+        for comp in result.chain:
+            if isinstance(comp, Plain) and comp.text:
+                if '\u200b' in comp.text:
+                    has_external_at_processing = True
+                comp.text = comp.text.replace('\u200b \u200b', '__ZWSP_DOUBLE__')
+                comp.text = comp.text.replace('\u200b', '__ZWSP_SINGLE__')
 
         # 4. 获取分段配置
         split_mode = self.config.get("split_mode", "regex")
@@ -169,7 +178,7 @@ class MessageSplitterPlugin(Star):
 
         # 如果最终只有一段且没有清理需求，则无需分段操作，直接返回由框架处理
         if len(segments) <= 1 and not clean_pattern and not at_needs_processing:
-            return
+            pass # 这里不能直接 return，需要走到底部进行占位符还原
 
         # 7. 处理引用回复：仅在第一段注入 Reply 组件
         if enable_reply and segments and event.message_obj.message_id:
@@ -177,7 +186,8 @@ class MessageSplitterPlugin(Star):
             if not has_reply:
                 segments[0].insert(0, Reply(id=event.message_obj.message_id))
 
-        logger.info(f"[Splitter] 消息被分为 {len(segments)} 段。")
+        if len(segments) > 1:
+            logger.info(f"[Splitter] 消息被分为 {len(segments)} 段。")
 
         # 8. 预处理：应用清理正则
         if clean_pattern:
@@ -186,32 +196,38 @@ class MessageSplitterPlugin(Star):
                     if isinstance(comp, Plain) and comp.text:
                         comp.text = re.sub(clean_pattern, "", comp.text)
 
-        # 9. 预处理：At 组件前后的空格清理
-        # 根据不同策略，剔除 At 标签旁边可能多出来的空格
-        for seg in segments:
-            idx = 0
-            while idx < len(seg):
-                if type(seg[idx]).__name__.lower() == 'at':
-                    # 处理前置空格
-                    if at_strategy in ["嵌入", "跟随上段"]:
-                        for prev_idx in range(idx - 1, -1, -1):
-                            if isinstance(seg[prev_idx], Plain):
-                                seg[prev_idx].text = seg[prev_idx].text.rstrip(" \t")
-                                break
-                            elif type(seg[prev_idx]).__name__.lower() not in ['at', 'reply']:
-                                break
-                    # 处理后置空格
-                    if at_strategy in ["嵌入", "跟随下段", "接下文"]:
-                        for next_idx in range(idx + 1, len(seg)):
-                            if isinstance(seg[next_idx], Plain):
-                                seg[next_idx].text = seg[next_idx].text.lstrip(" \t")
-                                break
-                            elif type(seg[next_idx]).__name__.lower() not in ['at']:
-                                break
-                idx += 1
+        # 9. 预处理：At 组件前后的空格清理 (智能判断单一单词与长句)
+        # 如果已被 AtTool 插件处理过，分段器主动让步，跳过二次清理避免冲突
+        if not has_external_at_processing:
+            for seg in segments:
+                idx = 0
+                while idx < len(seg):
+                    if type(seg[idx]).__name__.lower() == 'at':
+                        # 处理前置空格
+                        if at_strategy in ["嵌入", "跟随上段"]:
+                            for prev_idx in range(idx - 1, -1, -1):
+                                if isinstance(seg[prev_idx], Plain):
+                                    text = seg[prev_idx].text
+                                    if not re.search(r'[a-zA-Z0-9\']+\s+[a-zA-Z0-9\']+\s+$', text):
+                                        seg[prev_idx].text = text.rstrip(" \t")
+                                    break
+                                elif type(seg[prev_idx]).__name__.lower() not in ['at', 'reply']:
+                                    break
+                        # 处理后置空格
+                        if at_strategy in ["嵌入", "跟随下段", "接下文"]:
+                            for next_idx in range(idx + 1, len(seg)):
+                                if isinstance(seg[next_idx], Plain):
+                                    text = seg[next_idx].text
+                                    if not re.search(r'^\s+[a-zA-Z0-9\']+\s+[a-zA-Z0-9\']+', text):
+                                        seg[next_idx].text = text.lstrip(" \t")
+                                    break
+                                elif type(seg[next_idx]).__name__.lower() not in ['at']:
+                                    break
+                    idx += 1
 
         # 10. 预处理：注入零宽字符 \u200b，防止 At 后面的文本被误解析
-        if at_needs_processing:
+        # 同理，如果已有其他插件注入，则此步主动让步
+        if at_needs_processing and not has_external_at_processing:
             for seg in segments:
                 idx = 0
                 while idx < len(seg):
@@ -219,12 +235,30 @@ class MessageSplitterPlugin(Star):
                         found_plain = False
                         for next_idx in range(idx + 1, len(seg)):
                             if isinstance(seg[next_idx], Plain):
-                                seg[next_idx].text = "\u200b \u200b" + seg[next_idx].text
+                                text = seg[next_idx].text
+                                if re.search(r'\u200b\s\u200b', text):
+                                    pass
+                                else:
+                                    seg[next_idx].text = "\u200b \u200b" + text
                                 found_plain = True
                                 break
                         if not found_plain:
                             seg.insert(idx + 1, Plain("\u200b \u200b"))
                     idx += 1
+
+        # === 兼容性处理：完美还原脱敏的占位符 ===
+        for seg in segments:
+            for comp in seg:
+                if isinstance(comp, Plain) and comp.text:
+                    comp.text = comp.text.replace('__ZWSP_DOUBLE__', '\u200b \u200b')
+                    comp.text = comp.text.replace('__ZWSP_SINGLE__', '\u200b')
+
+        # 如果只有一段（被上面的判定拦截掉），在这里替换完占位符后直接返回交由框架处理
+        if len(segments) <= 1 and not clean_pattern and not at_needs_processing:
+            result.chain.clear()
+            if segments:
+                result.chain.extend(segments[0])
+            return
 
         # 11. 发送前 N-1 段消息
         for i in range(len(segments) - 1):
@@ -256,16 +290,17 @@ class MessageSplitterPlugin(Star):
                 logger.error(f"[Splitter] 发送分段 {i+1} 失败: {e}")
 
         # 12. 处理最后一段消息：最后一段直接修改 result.chain，交由框架自身完成最终发送
-        last_segment = segments[-1]
-        last_text = "".join([c.text for c in last_segment if isinstance(c, Plain)])
-        last_has_media = any(not isinstance(c, Plain) for c in last_segment)
-        
-        if not last_text.strip() and not last_has_media:
-            result.chain.clear() # 如果最后一段为空则清除，防止发送空消息
-        else:
-            self._log_segment(len(segments), len(segments), last_segment, "交给框架")
-            result.chain.clear()
-            result.chain.extend(last_segment)
+        if segments:
+            last_segment = segments[-1]
+            last_text = "".join([c.text for c in last_segment if isinstance(c, Plain)])
+            last_has_media = any(not isinstance(c, Plain) for c in last_segment)
+            
+            if not last_text.strip() and not last_has_media:
+                result.chain.clear() # 如果最后一段为空则清除，防止发送空消息
+            else:
+                self._log_segment(len(segments), len(segments), last_segment, "交给框架")
+                result.chain.clear()
+                result.chain.extend(last_segment)
 
     def _log_segment(self, index: int, total: int, chain: List[BaseMessageComponent], method: str):
         """记录分段内容的辅助日志方法"""
