@@ -42,6 +42,8 @@ class MessageSplitterPlugin(Star):
         在大语言模型请求前注入系统提示词。
         引导模型使用特定格式输出颜文字，防止颜文字内部的符号被分段器误识别为切分点。
         """
+        if not self.config.get("inject_kaomoji_prompt", True):
+            return
         instruction = (
             "\n【特别注意】如果你需要输出颜文字（如 (QAQ)），请务必使用三对反引号包裹，"
             "格式如：```(QAQ)```。这能确保颜文字作为一个整体被发送，不会被分段工具切断。"
@@ -71,6 +73,12 @@ class MessageSplitterPlugin(Star):
         # 2. 作用范围判定：根据配置决定是仅分段 LLM 回复还是分段所有消息
         split_scope = self.config.get("split_scope", "llm_only")
         is_llm_reply = getattr(event, "__is_llm_reply", False)
+        platform_name = event.get_platform_name()
+
+        if self.config.get("disable_active_split_on_restricted_platforms", True):
+            restricted_platforms = {"qq_official", "weixin_official_account", "dingtalk"}
+            if platform_name in restricted_platforms:
+                return
 
         if split_scope == "llm_only" and not is_llm_reply:
             return
