@@ -6,11 +6,12 @@ import asyncio
 from typing import List, Dict
 
 from astrbot.api.event import filter, AstrMessageEvent, MessageChain
-from astrbot.api.star import Context, Star, register
+from astrbot.api.star import Context, Star
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api.message_components import Plain, BaseMessageComponent, Reply, Record
 from astrbot.core.star.session_llm_manager import SessionServiceManager
+
 
 class MessageSplitterPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -18,8 +19,15 @@ class MessageSplitterPlugin(Star):
         self.config = config
         # 定义成对出现的字符，在智能分段时避免在这些符号内部切断
         self.pair_map = {
-            '"': '"', '《': '》', '（': '）', '(': ')', 
-            '[': ']', '{': '}', "'": "'", '【': '】', '<': '>'
+            '"': '"',
+            "《": "》",
+            "（": "）",
+            "(": ")",
+            "[": "]",
+            "{": "}",
+            "'": "'",
+            "【": "】",
+            "<": ">",
         }
         # 定义引用/引号字符
         self.quote_chars = {'"', "'", "`"}
@@ -27,14 +35,18 @@ class MessageSplitterPlugin(Star):
         self.balanced_mode = self.config.get("balanced_split_mode", False)
         try:
             self.min_seg_length = max(int(self.config.get("min_segment_length", 10)), 1)
-            self.split_ratio_min = float(self.config.get("balanced_split_ratio_min", 0.4))
-            self.split_ratio_max = float(self.config.get("balanced_split_ratio_max", 0.9))
+            self.split_ratio_min = float(
+                self.config.get("balanced_split_ratio_min", 0.4)
+            )
+            self.split_ratio_max = float(
+                self.config.get("balanced_split_ratio_max", 0.9)
+            )
         except (ValueError, TypeError):
             self.min_seg_length = 10
             self.split_ratio_min = 0.4
             self.split_ratio_max = 0.9
-            
-        self.secondary_pattern = re.compile(r'[，,、；;]+')
+
+        self.secondary_pattern = re.compile(r"[，,、；;]+")
 
     @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
@@ -53,9 +65,42 @@ class MessageSplitterPlugin(Star):
     @filter.on_llm_response()
     async def on_llm_response(self, event: AstrMessageEvent, resp: LLMResponse):
         """
-        标记该事件为 LLM 生成的回复，用于分段作用范围的判定。
+        为旧版 AstrBot 保留兜底标记。
+        新版优先使用 MessageEventResult.result_content_type 判定消息来源。
         """
         setattr(event, "__is_llm_reply", True)
+
+    def _is_model_generated_reply(self, event: AstrMessageEvent, result) -> bool:
+        """
+        优先使用 AstrBot 本体的结果类型判定消息来源，避免将普通插件结果误判为 LLM 回复。
+        仅当运行环境缺少正式类型信息时，才退回旧版事件标记。
+        """
+        if not result:
+            return False
+
+        is_model_result = getattr(result, "is_model_result", None)
+        if callable(is_model_result):
+            try:
+                return bool(is_model_result())
+            except Exception as e:
+                logger.debug(f"[Splitter] is_model_result() 判定失败，尝试回退: {e}")
+
+        is_llm_result = getattr(result, "is_llm_result", None)
+        if callable(is_llm_result):
+            try:
+                if is_llm_result():
+                    return True
+            except Exception as e:
+                logger.debug(f"[Splitter] is_llm_result() 判定失败，尝试回退: {e}")
+
+        content_type = getattr(result, "result_content_type", None)
+        if content_type is not None:
+            return getattr(content_type, "name", None) in {
+                "LLM_RESULT",
+                "AGENT_RUNNER_ERROR",
+            }
+
+        return getattr(event, "__is_llm_reply", False)
 
     @filter.on_decorating_result(priority=-100000000000000000)
     async def on_decorating_result(self, event: AstrMessageEvent):
@@ -72,13 +117,7 @@ class MessageSplitterPlugin(Star):
 
         # 2. 作用范围判定：根据配置决定是仅分段 LLM 回复还是分段所有消息
         split_scope = self.config.get("split_scope", "llm_only")
-        is_llm_reply = getattr(event, "__is_llm_reply", False)
-        platform_name = event.get_platform_name()
-
-        if self.config.get("disable_active_split_on_restricted_platforms", True):
-            restricted_platforms = {"qq_official", "weixin_official_account", "dingtalk"}
-            if platform_name in restricted_platforms:
-                return
+        is_llm_reply = self._is_model_generated_reply(event, result)
 
         if split_scope == "llm_only" and not is_llm_reply:
             return
@@ -98,10 +137,10 @@ class MessageSplitterPlugin(Star):
         has_external_at_processing = False
         for comp in result.chain:
             if isinstance(comp, Plain) and comp.text:
-                if '\u200b' in comp.text:
+                if "\u200b" in comp.text:
                     has_external_at_processing = True
-                comp.text = comp.text.replace('\u200b \u200b', '__ZWSP_DOUBLE__')
-                comp.text = comp.text.replace('\u200b', '__ZWSP_SINGLE__')
+                comp.text = comp.text.replace("\u200b \u200b", "__ZWSP_DOUBLE__")
+                comp.text = comp.text.replace("\u200b", "__ZWSP_SINGLE__")
 
         # 4. 获取分段配置
         split_mode = self.config.get("split_mode", "regex")
@@ -121,73 +160,91 @@ class MessageSplitterPlugin(Star):
 
         # 非文本组件（图片、艾特、表情等）的分段策略
         strategies = {
-            'image': self.config.get("image_strategy", "单独"),
-            'at': self.config.get("at_strategy", "跟随下段"),
-            'face': self.config.get("face_strategy", "嵌入"),
-            'default': self.config.get("other_media_strategy", "跟随下段")
+            "image": self.config.get("image_strategy", "单独"),
+            "at": self.config.get("at_strategy", "跟随下段"),
+            "face": self.config.get("face_strategy", "嵌入"),
+            "default": self.config.get("other_media_strategy", "跟随下段"),
         }
 
         ideal_length = 0
         if self.balanced_mode and max_segs > 0:
-            text_weight = sum(len(c.text.replace(" ", "")) for c in result.chain if isinstance(c, Plain))
-            
+            text_weight = sum(
+                len(c.text.replace(" ", ""))
+                for c in result.chain
+                if isinstance(c, Plain)
+            )
+
             solo_media_count = 0
             for c in result.chain:
                 if not isinstance(c, Plain) and not isinstance(c, Reply):
                     c_type = type(c).__name__.lower()
-                    if 'image' in c_type and strategies.get('image', '单独') == "单独":
+                    if "image" in c_type and strategies.get("image", "单独") == "单独":
                         solo_media_count += 1
-                    elif 'at' in c_type and strategies.get('at', '跟随下段') == "单独":
+                    elif "at" in c_type and strategies.get("at", "跟随下段") == "单独":
                         solo_media_count += 1
-                    elif 'face' in c_type and strategies.get('face', '嵌入') == "单独":
+                    elif "face" in c_type and strategies.get("face", "嵌入") == "单独":
                         solo_media_count += 1
-                    elif 'image' not in c_type and 'at' not in c_type and 'face' not in c_type and strategies.get('default', '跟随下段') == "单独":
+                    elif (
+                        "image" not in c_type
+                        and "at" not in c_type
+                        and "face" not in c_type
+                        and strategies.get("default", "跟随下段") == "单独"
+                    ):
                         solo_media_count += 1
-            
+
             target_text_segs = max(1, max_segs - solo_media_count)
-            
+
             if text_weight > 0:
-                ideal_length = max(math.ceil(text_weight / target_text_segs), self.min_seg_length)
+                ideal_length = max(
+                    math.ceil(text_weight / target_text_segs), self.min_seg_length
+                )
                 if text_weight < ideal_length * 1.2:
                     ideal_length = 0
 
         # 5. 执行切分：将原始消息链分解为多个子链（segments）
         segments = self.split_chain_smart(
-            result.chain, 
-            split_pattern, 
-            smart_mode, 
-            strategies, 
+            result.chain,
+            split_pattern,
+            smart_mode,
+            strategies,
             enable_reply,
-            ideal_length
+            ideal_length,
         )
 
         if self.balanced_mode and len(segments) >= 2:
-            last_seg_text = "".join([c.text for c in segments[-1] if isinstance(c, Plain)]).replace(" ", "")
+            last_seg_text = "".join(
+                [c.text for c in segments[-1] if isinstance(c, Plain)]
+            ).replace(" ", "")
             if 0 < len(last_seg_text) < self.min_seg_length:
-                last_has_media = any(not isinstance(c, Plain) and not isinstance(c, Reply) for c in segments[-1])
+                last_has_media = any(
+                    not isinstance(c, Plain) and not isinstance(c, Reply)
+                    for c in segments[-1]
+                )
                 if not last_has_media:
                     short_tail = segments.pop()
                     segments[-1].extend(short_tail)
 
         # 6. 最大分段数限制：如果段数过多，则强行合并最后几段，避免消息轰炸
         if len(segments) > max_segs and max_segs > 0:
-            logger.warning(f"[Splitter] 分段数({len(segments)}) 超过限制({max_segs})，合并剩余段落。")
+            logger.warning(
+                f"[Splitter] 分段数({len(segments)}) 超过限制({max_segs})，合并剩余段落。"
+            )
             merged_last = []
-            final_segments = segments[:max_segs-1]
-            for seg in segments[max_segs-1:]:
+            final_segments = segments[: max_segs - 1]
+            for seg in segments[max_segs - 1 :]:
                 merged_last.extend(seg)
             final_segments.append(merged_last)
             segments = final_segments
 
         # 判定是否需要对 At 组件执行特殊处理逻辑
-        at_strategy = strategies.get('at', "跟随下段")
+        at_strategy = strategies.get("at", "跟随下段")
         at_needs_processing = at_strategy in ["接下文", "跟随下段", "嵌入"] and any(
-            type(c).__name__.lower() == 'at' for c in result.chain
+            type(c).__name__.lower() == "at" for c in result.chain
         )
 
         # 如果最终只有一段且没有清理需求，则无需分段操作，直接返回由框架处理
         if len(segments) <= 1 and not clean_pattern and not at_needs_processing:
-            pass # 这里不能直接 return，需要走到底部进行占位符还原
+            pass  # 这里不能直接 return，需要走到底部进行占位符还原
 
         # 7. 处理引用回复：仅在第一段注入 Reply 组件
         if enable_reply and segments and event.message_obj.message_id:
@@ -211,26 +268,33 @@ class MessageSplitterPlugin(Star):
             for seg in segments:
                 idx = 0
                 while idx < len(seg):
-                    if type(seg[idx]).__name__.lower() == 'at':
+                    if type(seg[idx]).__name__.lower() == "at":
                         # 处理前置空格
                         if at_strategy in ["嵌入", "跟随上段"]:
                             for prev_idx in range(idx - 1, -1, -1):
                                 if isinstance(seg[prev_idx], Plain):
                                     text = seg[prev_idx].text
-                                    if not re.search(r'[a-zA-Z0-9\']+\s+[a-zA-Z0-9\']+\s+$', text):
+                                    if not re.search(
+                                        r"[a-zA-Z0-9\']+\s+[a-zA-Z0-9\']+\s+$", text
+                                    ):
                                         seg[prev_idx].text = text.rstrip(" \t")
                                     break
-                                elif type(seg[prev_idx]).__name__.lower() not in ['at', 'reply']:
+                                elif type(seg[prev_idx]).__name__.lower() not in [
+                                    "at",
+                                    "reply",
+                                ]:
                                     break
                         # 处理后置空格
                         if at_strategy in ["嵌入", "跟随下段", "接下文"]:
                             for next_idx in range(idx + 1, len(seg)):
                                 if isinstance(seg[next_idx], Plain):
                                     text = seg[next_idx].text
-                                    if not re.search(r'^\s+[a-zA-Z0-9\']+\s+[a-zA-Z0-9\']+', text):
+                                    if not re.search(
+                                        r"^\s+[a-zA-Z0-9\']+\s+[a-zA-Z0-9\']+", text
+                                    ):
                                         seg[next_idx].text = text.lstrip(" \t")
                                     break
-                                elif type(seg[next_idx]).__name__.lower() not in ['at']:
+                                elif type(seg[next_idx]).__name__.lower() not in ["at"]:
                                     break
                     idx += 1
 
@@ -240,12 +304,12 @@ class MessageSplitterPlugin(Star):
             for seg in segments:
                 idx = 0
                 while idx < len(seg):
-                    if type(seg[idx]).__name__.lower() == 'at':
+                    if type(seg[idx]).__name__.lower() == "at":
                         found_plain = False
                         for next_idx in range(idx + 1, len(seg)):
                             if isinstance(seg[next_idx], Plain):
                                 text = seg[next_idx].text
-                                if re.search(r'\u200b\s\u200b', text):
+                                if re.search(r"\u200b\s\u200b", text):
                                     pass
                                 else:
                                     seg[next_idx].text = "\u200b \u200b" + text
@@ -259,8 +323,8 @@ class MessageSplitterPlugin(Star):
         for seg in segments:
             for comp in seg:
                 if isinstance(comp, Plain) and comp.text:
-                    comp.text = comp.text.replace('__ZWSP_DOUBLE__', '\u200b \u200b')
-                    comp.text = comp.text.replace('__ZWSP_SINGLE__', '\u200b')
+                    comp.text = comp.text.replace("__ZWSP_DOUBLE__", "\u200b \u200b")
+                    comp.text = comp.text.replace("__ZWSP_SINGLE__", "\u200b")
 
         # 仅裁剪每段首尾的空白行，保留段内原始换行格式
         if trim_segment_edge_blank_lines:
@@ -277,17 +341,21 @@ class MessageSplitterPlugin(Star):
         # 11. 发送前 N-1 段消息
         for i in range(len(segments) - 1):
             segment_chain = segments[i]
-            
+
             # 校验该段落是否为空内容
-            text_content = "".join([c.text for c in segment_chain if isinstance(c, Plain)])
+            text_content = "".join(
+                [c.text for c in segment_chain if isinstance(c, Plain)]
+            )
             has_media = any(not isinstance(c, Plain) for c in segment_chain)
             if not text_content.strip() and not has_media:
                 continue
 
             try:
                 # 尝试为当前分段生成 TTS（语音）组件
-                segment_chain = await self._process_tts_for_segment(event, segment_chain)
-                
+                segment_chain = await self._process_tts_for_segment(
+                    event, segment_chain
+                )
+
                 # 打印日志
                 self._log_segment(i + 1, len(segments), segment_chain, "主动发送")
 
@@ -301,22 +369,26 @@ class MessageSplitterPlugin(Star):
                 await asyncio.sleep(wait_time)
 
             except Exception as e:
-                logger.error(f"[Splitter] 发送分段 {i+1} 失败: {e}")
+                logger.error(f"[Splitter] 发送分段 {i + 1} 失败: {e}")
 
         # 12. 处理最后一段消息：最后一段直接修改 result.chain，交由框架自身完成最终发送
         if segments:
             last_segment = segments[-1]
             last_text = "".join([c.text for c in last_segment if isinstance(c, Plain)])
             last_has_media = any(not isinstance(c, Plain) for c in last_segment)
-            
+
             if not last_text.strip() and not last_has_media:
-                result.chain.clear() # 如果最后一段为空则清除，防止发送空消息
+                result.chain.clear()  # 如果最后一段为空则清除，防止发送空消息
             else:
-                self._log_segment(len(segments), len(segments), last_segment, "交给框架")
+                self._log_segment(
+                    len(segments), len(segments), last_segment, "交给框架"
+                )
                 result.chain.clear()
                 result.chain.extend(last_segment)
 
-    def _log_segment(self, index: int, total: int, chain: List[BaseMessageComponent], method: str):
+    def _log_segment(
+        self, index: int, total: int, chain: List[BaseMessageComponent], method: str
+    ):
         """记录分段内容的辅助日志方法"""
         content_str = ""
         for comp in chain:
@@ -324,8 +396,8 @@ class MessageSplitterPlugin(Star):
                 content_str += comp.text
             else:
                 content_str += f"[{type(comp).__name__}]"
-        
-        log_content = content_str.replace('\n', '\\n')
+
+        log_content = content_str.replace("\n", "\\n")
         logger.info(f"[Splitter] 第 {index}/{total} 段 ({method}): {log_content}")
 
     def _trim_segment_edge_blank_lines(self, segment: List[BaseMessageComponent]) -> None:
@@ -354,36 +426,36 @@ class MessageSplitterPlugin(Star):
         # 检查插件配置是否启用 TTS
         if not self.config.get("enable_tts_for_segments", True):
             return segment
-        
+
         try:
             # 获取当前会话的 TTS 相关全局配置
             all_config = self.context.get_config(event.unified_msg_origin)
             tts_config = all_config.get("provider_tts_settings", {})
-            
+
             # 若框架层面未启用 TTS 则直接返回
             if not tts_config.get("enable", False):
                 return segment
-            
+
             # 获取当前正在使用的 TTS 提供商
             tts_provider = self.context.get_using_tts_provider(event.unified_msg_origin)
             if not tts_provider:
                 return segment
-            
+
             # 校验是否为 LLM 结果以及是否满足发送语音的条件
             result = event.get_result()
             if not result or not result.is_llm_result():
                 return segment
-            
+
             if not await SessionServiceManager.should_process_tts_request(event):
                 return segment
-            
+
             # 判定触发概率
             tts_trigger_prob = tts_config.get("trigger_probability", 1.0)
             if random.random() > float(tts_trigger_prob):
                 return segment
-            
-            dual_output = tts_config.get("dual_output", False) # 是否同时发送文本和语音
-            
+
+            dual_output = tts_config.get("dual_output", False)  # 是否同时发送文本和语音
+
             new_segment = []
             for comp in segment:
                 # 仅对长度大于 1 的纯文本进行语音化
@@ -393,7 +465,8 @@ class MessageSplitterPlugin(Star):
                         audio_path = await tts_provider.get_audio(comp.text)
                         if audio_path:
                             new_segment.append(Record(file=audio_path, url=audio_path))
-                            if dual_output: new_segment.append(comp)
+                            if dual_output:
+                                new_segment.append(comp)
                         else:
                             new_segment.append(comp)
                     except Exception as e:
@@ -402,7 +475,7 @@ class MessageSplitterPlugin(Star):
                 else:
                     new_segment.append(comp)
             return new_segment
-            
+
         except Exception as e:
             logger.error(f"[Splitter] TTS 配置检查失败: {e}")
             return segment
@@ -412,7 +485,9 @@ class MessageSplitterPlugin(Star):
         strategy = self.config.get("delay_strategy", "linear")
         if strategy == "random":
             # 随机延迟
-            return random.uniform(self.config.get("random_min", 1.0), self.config.get("random_max", 3.0))
+            return random.uniform(
+                self.config.get("random_min", 1.0), self.config.get("random_max", 3.0)
+            )
         elif strategy == "log":
             # 对数延迟：字数越多延迟增加越缓
             base = self.config.get("log_base", 0.5)
@@ -420,11 +495,21 @@ class MessageSplitterPlugin(Star):
             return min(base + factor * math.log(len(text) + 1), 5.0)
         elif strategy == "linear":
             # 线性延迟：固定基础延迟 + (字数 * 系数)
-            return self.config.get("linear_base", 0.5) + (len(text) * self.config.get("linear_factor", 0.1))
+            return self.config.get("linear_base", 0.5) + (
+                len(text) * self.config.get("linear_factor", 0.1)
+            )
         else:
             return self.config.get("fixed_delay", 1.5)
 
-    def split_chain_smart(self, chain: List[BaseMessageComponent], pattern: str, smart_mode: bool, strategies: Dict[str, str], enable_reply: bool, ideal_length: int = 0) -> List[List[BaseMessageComponent]]:
+    def split_chain_smart(
+        self,
+        chain: List[BaseMessageComponent],
+        pattern: str,
+        smart_mode: bool,
+        strategies: Dict[str, str],
+        enable_reply: bool,
+        ideal_length: int = 0,
+    ) -> List[List[BaseMessageComponent]]:
         """
         智能分段核心逻辑：遍历消息组件链，根据组件类型和文本内容进行分段。
         """
@@ -436,28 +521,41 @@ class MessageSplitterPlugin(Star):
             if isinstance(component, Plain):
                 # 文本组件：根据正则模式切分
                 text = component.text
-                if not text: continue
+                if not text:
+                    continue
                 if not smart_mode:
-                    self._process_text_simple(text, pattern, segments, current_chain_buffer)
+                    self._process_text_simple(
+                        text, pattern, segments, current_chain_buffer
+                    )
                     current_chain_weight = 0
                 else:
                     current_chain_weight = self._process_text_smart(
-                        text, pattern, segments, current_chain_buffer, current_chain_weight, ideal_length
+                        text,
+                        pattern,
+                        segments,
+                        current_chain_buffer,
+                        current_chain_weight,
+                        ideal_length,
                     )
             else:
                 # 非文本组件（如图片、表情等）
                 c_type = type(component).__name__.lower()
-                
+
                 # 保留引用组件
-                if 'reply' in c_type:
-                    if enable_reply: current_chain_buffer.append(component)
+                if "reply" in c_type:
+                    if enable_reply:
+                        current_chain_buffer.append(component)
                     continue
 
                 # 判定当前组件采用何种分段策略
-                if 'image' in c_type: strategy = strategies['image']
-                elif 'at' in c_type: strategy = strategies['at']
-                elif 'face' in c_type: strategy = strategies['face']
-                else: strategy = strategies['default']
+                if "image" in c_type:
+                    strategy = strategies["image"]
+                elif "at" in c_type:
+                    strategy = strategies["at"]
+                elif "face" in c_type:
+                    strategy = strategies["face"]
+                else:
+                    strategy = strategies["default"]
 
                 if strategy == "单独":
                     # 将之前的内容打包，当前组件单独作为一段，并开启下一段
@@ -484,7 +582,7 @@ class MessageSplitterPlugin(Star):
                         current_chain_buffer.clear()
                         current_chain_weight = 0
                     current_chain_buffer.append(component)
-                else: 
+                else:
                     # 嵌入模式：直接加入缓冲区，等待自然切分
                     current_chain_buffer.append(component)
 
@@ -493,12 +591,15 @@ class MessageSplitterPlugin(Star):
             segments.append(current_chain_buffer)
         return [seg for seg in segments if seg]
 
-    def _process_text_simple(self, text: str, pattern: str, segments: list, buffer: list):
+    def _process_text_simple(
+        self, text: str, pattern: str, segments: list, buffer: list
+    ):
         """简单文本切分逻辑"""
         parts = re.split(f"({pattern})", text)
         temp_text = ""
         for part in parts:
-            if not part: continue
+            if not part:
+                continue
             if re.fullmatch(pattern, part):
                 # 如果匹配到分隔符，则将累计的文本推入分段
                 temp_text += part
@@ -511,14 +612,22 @@ class MessageSplitterPlugin(Star):
         if temp_text:
             buffer.append(Plain(temp_text))
 
-    def _process_text_smart(self, text: str, pattern: str, segments: list, buffer: list, start_weight: int = 0, ideal_length: int = 0) -> int:
+    def _process_text_smart(
+        self,
+        text: str,
+        pattern: str,
+        segments: list,
+        buffer: list,
+        start_weight: int = 0,
+        ideal_length: int = 0,
+    ) -> int:
         """
         智能文本切分逻辑：
         1. 保护代码块（```）。
         2. 保护成对符号（括号、引号）不被中途切断。
         3. 保护英文上下文及数字。
         """
-        stack = [] # 符号栈，用于追踪嵌套
+        stack = []  # 符号栈，用于追踪嵌套
         compiled_pattern = re.compile(pattern)
         i = 0
         n = len(text)
@@ -530,51 +639,54 @@ class MessageSplitterPlugin(Star):
             if text.startswith("```", i):
                 next_idx = text.find("```", i + 3)
                 if next_idx != -1:
-                    current_chunk += text[i:next_idx+3]
-                    current_weight += (next_idx + 3 - i)
+                    current_chunk += text[i : next_idx + 3]
+                    current_weight += next_idx + 3 - i
                     i = next_idx + 3
                     continue
                 else:
                     current_chunk += text[i:]
-                    current_weight += (n - i)
+                    current_weight += n - i
                     break
 
             char = text[i]
             is_opener = char in self.pair_map
-            
+
             # 2. 引号处理
             if char in self.quote_chars:
-                if stack and stack[-1] == char: 
-                    stack.pop() # 引号闭合
-                else: 
-                    stack.append(char) # 引号开启
+                if stack and stack[-1] == char:
+                    stack.pop()  # 引号闭合
+                else:
+                    stack.append(char)  # 引号开启
                 current_chunk += char
-                if not char.isspace(): current_weight += 1
+                if not char.isspace():
+                    current_weight += 1
                 i += 1
                 continue
-            
+
             # 3. 若当前处于成对符号/引号内部
             if stack:
                 expected_closer = self.pair_map.get(stack[-1])
-                if char == expected_closer: 
-                    stack.pop() # 符号匹配闭合
-                elif is_opener and char not in self.quote_chars: 
-                    stack.append(char) # 嵌套开启
-                
+                if char == expected_closer:
+                    stack.pop()  # 符号匹配闭合
+                elif is_opener and char not in self.quote_chars:
+                    stack.append(char)  # 嵌套开启
+
                 # 符号内部的换行符替换为空格，保持块的完整性
-                if char == '\n': 
-                    current_chunk += ' '
-                else: 
+                if char == "\n":
+                    current_chunk += " "
+                else:
                     current_chunk += char
-                    if not char.isspace(): current_weight += 1
+                    if not char.isspace():
+                        current_weight += 1
                 i += 1
                 continue
-                
+
             # 4. 进入新的成对符号
             if is_opener:
                 stack.append(char)
                 current_chunk += char
-                if not char.isspace(): current_weight += 1
+                if not char.isspace():
+                    current_weight += 1
                 i += 1
                 continue
 
@@ -583,28 +695,41 @@ class MessageSplitterPlugin(Star):
             if match:
                 delimiter = match.group()
                 should_split = True
-                
-                if ideal_length > 0 and current_weight < ideal_length * self.split_ratio_min:
+
+                if (
+                    ideal_length > 0
+                    and current_weight < ideal_length * self.split_ratio_min
+                ):
                     should_split = False
 
-                prev_char = text[i-1] if i > 0 else ""
-                next_char = text[i+len(delimiter)] if i+len(delimiter) < n else ""
-                
+                prev_char = text[i - 1] if i > 0 else ""
+                next_char = text[i + len(delimiter)] if i + len(delimiter) < n else ""
+
                 # 英文与数字边界保护逻辑
-                if '\n' not in delimiter and bool(re.match(r'^[ \t.?!,;:\-\']+$', delimiter)):
+                if "\n" not in delimiter and bool(
+                    re.match(r"^[ \t.?!,;:\-\']+$", delimiter)
+                ):
                     # 保护英文短句或标点不被切开
-                    if bool(re.match(r'^[ \t,;:\-\']+$', delimiter)):
-                        prev_is_en = (not prev_char) or bool(re.match(r'^[a-zA-Z0-9 \t.?!,;:\-\']$', prev_char))
-                        next_is_en = (not next_char) or bool(re.match(r'^[a-zA-Z0-9 \t.?!,;:\-\']$', next_char))
+                    if bool(re.match(r"^[ \t,;:\-\']+$", delimiter)):
+                        prev_is_en = (not prev_char) or bool(
+                            re.match(r"^[a-zA-Z0-9 \t.?!,;:\-\']$", prev_char)
+                        )
+                        next_is_en = (not next_char) or bool(
+                            re.match(r"^[a-zA-Z0-9 \t.?!,;:\-\']$", next_char)
+                        )
                         if prev_is_en and next_is_en:
                             current_chunk += delimiter
                             current_weight += len(delimiter)
                             i += len(delimiter)
                             continue
-                            
+
                     # 保护数字中的小数点
-                    if bool(re.match(r'^[ \t.?!]+$', delimiter)):
-                        if '.' in delimiter and bool(re.match(r'^\d$', prev_char)) and bool(re.match(r'^\d$', next_char)):
+                    if bool(re.match(r"^[ \t.?!]+$", delimiter)):
+                        if (
+                            "." in delimiter
+                            and bool(re.match(r"^\d$", prev_char))
+                            and bool(re.match(r"^\d$", next_char))
+                        ):
                             current_chunk += delimiter
                             current_weight += len(delimiter)
                             i += len(delimiter)
@@ -624,8 +749,11 @@ class MessageSplitterPlugin(Star):
                     current_weight += len(delimiter)
                     i += len(delimiter)
                 continue
-            
-            elif ideal_length > 0 and current_weight >= ideal_length * self.split_ratio_max:
+
+            elif (
+                ideal_length > 0
+                and current_weight >= ideal_length * self.split_ratio_max
+            ):
                 sec_match = self.secondary_pattern.match(text, pos=i)
                 if sec_match:
                     delimiter = sec_match.group()
@@ -633,8 +761,12 @@ class MessageSplitterPlugin(Star):
 
                     if delimiter.strip() in [",", "，", ".", "。"]:
                         prev_char = text[i - 1] if i > 0 else ""
-                        next_char = text[i + len(delimiter)] if i + len(delimiter) < n else ""
-                        if bool(re.match(r'[a-zA-Z0-9]', prev_char)) and bool(re.match(r'[a-zA-Z0-9]', next_char)):
+                        next_char = (
+                            text[i + len(delimiter)] if i + len(delimiter) < n else ""
+                        )
+                        if bool(re.match(r"[a-zA-Z0-9]", prev_char)) and bool(
+                            re.match(r"[a-zA-Z0-9]", next_char)
+                        ):
                             is_protected = True
 
                     if not is_protected:
