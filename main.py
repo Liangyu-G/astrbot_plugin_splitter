@@ -54,6 +54,8 @@ class MessageSplitterPlugin(Star):
         在大语言模型请求前注入系统提示词。
         引导模型使用特定格式输出颜文字，防止颜文字内部的符号被分段器误识别为切分点。
         """
+        if not self.config.get("inject_kaomoji_prompt", True):
+            return
         instruction = (
             "\n【特别注意】如果你需要输出颜文字（如 (QAQ)），请务必使用三对反引号包裹，"
             "格式如：```(QAQ)```。这能确保颜文字作为一个整体被发送，不会被分段工具切断。"
@@ -150,12 +152,11 @@ class MessageSplitterPlugin(Star):
             # 正则模式：使用自定义正则切分
             split_pattern = self.config.get("split_regex", r"[。？！?!\\n…]+")
 
-        clean_pattern = self.config.get("clean_regex", "")  # 用于清理无用字符的正则
-        smart_mode = self.config.get(
-            "enable_smart_split", True
-        )  # 是否开启括号保护等智能模式
-        max_segs = self.config.get("max_segments", 7)  # 最大分段数
-        enable_reply = self.config.get("enable_reply", True)  # 是否在第一段保留引用回复
+        clean_pattern = self.config.get("clean_regex", "") # 用于清理无用字符的正则
+        smart_mode = self.config.get("enable_smart_split", True) # 是否开启括号保护等智能模式
+        max_segs = self.config.get("max_segments", 7) # 最大分段数
+        enable_reply = self.config.get("enable_reply", True) # 是否在第一段保留引用回复
+        trim_segment_edge_blank_lines = self.config.get("trim_segment_edge_blank_lines", True)
 
         # 非文本组件（图片、艾特、表情等）的分段策略
         strategies = {
@@ -325,6 +326,11 @@ class MessageSplitterPlugin(Star):
                     comp.text = comp.text.replace("__ZWSP_DOUBLE__", "\u200b \u200b")
                     comp.text = comp.text.replace("__ZWSP_SINGLE__", "\u200b")
 
+        # 仅裁剪每段首尾的空白行，保留段内原始换行格式
+        if trim_segment_edge_blank_lines:
+            for seg in segments:
+                self._trim_segment_edge_blank_lines(seg)
+
         # 如果只有一段（被上面的判定拦截掉），在这里替换完占位符后直接返回交由框架处理
         if len(segments) <= 1 and not clean_pattern and not at_needs_processing:
             result.chain.clear()
@@ -394,9 +400,28 @@ class MessageSplitterPlugin(Star):
         log_content = content_str.replace("\n", "\\n")
         logger.info(f"[Splitter] 第 {index}/{total} 段 ({method}): {log_content}")
 
-    async def _process_tts_for_segment(
-        self, event: AstrMessageEvent, segment: List[BaseMessageComponent]
-    ) -> List[BaseMessageComponent]:
+    def _trim_segment_edge_blank_lines(self, segment: List[BaseMessageComponent]) -> None:
+        """只移除单个分段首尾 Plain 文本中的空白行，保留中间正文换行。"""
+        first_plain = None
+        last_plain = None
+
+        for comp in segment:
+            if isinstance(comp, Plain):
+                first_plain = comp
+                break
+
+        for comp in reversed(segment):
+            if isinstance(comp, Plain):
+                last_plain = comp
+                break
+
+        if first_plain and first_plain.text:
+            first_plain.text = re.sub(r'^(?:[ \t]*\r?\n)+', '', first_plain.text)
+
+        if last_plain and last_plain.text:
+            last_plain.text = re.sub(r'(?:\r?\n[ \t]*)+$', '', last_plain.text)
+
+    async def _process_tts_for_segment(self, event: AstrMessageEvent, segment: List[BaseMessageComponent]) -> List[BaseMessageComponent]:
         """为单个消息分段转换 TTS 语音"""
         # 检查插件配置是否启用 TTS
         if not self.config.get("enable_tts_for_segments", True):
