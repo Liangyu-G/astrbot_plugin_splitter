@@ -23,6 +23,18 @@
     "type": "string",
     "default": ""
   },
+  "trim_segment_edge_blank_lines": {
+    "description": "是否清理每段首尾空行。",
+    "hint": "开启后，仅移除每个分段开头和结尾的空白行，不影响段内正文换行。",
+    "type": "bool",
+    "default": true
+  },
+  "inject_kaomoji_prompt": {
+    "description": "是否注入颜文字保护提示词。",
+    "hint": "开启后，会在 LLM 请求前追加提示，要求将颜文字用三反引号包裹，减少被错误分段的概率。",
+    "type": "bool",
+    "default": true
+  },
   "max_segments": {
     "description": "最大分段数量。",
     "type": "int",
@@ -72,6 +84,12 @@
     "type": "string",
     "options": ["llm_only", "all"],
     "default": "llm_only"
+  },
+  "disable_active_split_on_restricted_platforms": {
+    "description": "在受限平台禁用主动分段发送。",
+    "hint": "开启后，在 qq_official、weixin_official_account、dingtalk 上直接跳过本插件的主动分段发送，避免出现部分分段发送失败",
+    "type": "bool",
+    "default": true
   },
   "image_strategy": {
     "description": "图片组件的分段策略。",
