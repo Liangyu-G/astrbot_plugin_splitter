@@ -19,9 +19,28 @@
     "default": "[。？！?!\\n…]+"
   },
   "clean_regex": {
-    "description": "分段后清理内容的正则表达式。",
+    "description": "分段前清理内容的正则表达式。",
+    "hint": "【注意】清理将在切分之前执行！因此如填写 <think>.*?</think> 将可安全地彻底剥离内容而不受切分影响。",
     "type": "string",
     "default": ""
+  },
+  "enable_group_split": {
+    "description": "是否开启群聊分段",
+    "hint": "当群组分段导致刷屏时，可关闭该开关，默认开启。",
+    "type": "bool",
+    "default": true
+  },
+  "trim_segment_edge_blank_lines": {
+    "description": "是否清理每段首尾空行。",
+    "hint": "开启后，仅移除每个分段开头和结尾的空白行，不影响段内正文换行。",
+    "type": "bool",
+    "default": true
+  },
+  "inject_kaomoji_prompt": {
+    "description": "是否注入颜文字保护提示词。",
+    "hint": "开启后，会在 LLM 请求前追加提示，要求将颜文字用三反引号包裹，减少被错误分段的概率。",
+    "type": "bool",
+    "default": true
   },
   "max_segments": {
     "description": "最大分段数量。",
@@ -32,6 +51,28 @@
     "description":"分段阈值",
     "type": "int",
     "default": 0
+  },
+  "balanced_split_mode": {
+    "description": "智能均分模式",
+    "hint": "开启后，会自动用总字数除以最大分段数，尽量让每段字数均匀分布。",
+    "type": "bool",
+    "default": false
+  },
+"min_segment_length": {
+    "description": "均分时的最小段落长度",
+    "hint": "防止均分时切出只有几个字的碎片，建议设置 10-20。",
+    "type": "int",
+    "default": 10
+  },
+  "balanced_split_ratio_min": {
+    "description": "均分模式下，低于理想长度的该比例时不切分",
+    "type": "float",
+    "default": 0.4
+  },
+  "balanced_split_ratio_max": {
+    "description": "均分模式下，高于理想长度的该比例时寻找次级标点切分",
+    "type": "float",
+    "default": 0.9
   },
   "enable_smart_split": {
     "description": "是否开启智能识别(忽略引号内标点)。",
@@ -50,6 +91,12 @@
     "type": "string",
     "options": ["llm_only", "all"],
     "default": "llm_only"
+  },
+  "disable_active_split_on_restricted_platforms": {
+    "description": "在受限平台禁用主动分段发送。",
+    "hint": "开启后，在 qq_official、weixin_official_account、dingtalk 上直接跳过本插件的主动分段发送，避免出现部分分段发送失败",
+    "type": "bool",
+    "default": true
   },
   "image_strategy": {
     "description": "图片组件的分段策略。",
