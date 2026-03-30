@@ -7,37 +7,37 @@
     "default": "regex"
   },
   "split_chars": {
-    "description": "简单模式下的分段符号(仅Simple生效)",
+    "description": "简单模式下的分段符号（列表）。(仅Simple生效)",
     "hint": "可添加多个符号或文本，文字后面带这些内容就会分段（换行是 \\n），如添加：。 或 ！ 或 \\n",
     "type": "list",
     "default": ["。", "？", "！", "?", "!", "；", ";", "\n"]
   },
   "split_regex": {
-    "description": "正则模式下的分段表达式(仅Regex生效)",
+    "description": "正则模式下的分段表达式（文本框）。(仅Regex生效)",
     "hint": "支持高级正则匹配规则。",
     "type": "string",
     "default": "[。？！?!\\n…]+"
   },
   "clean_before_items": {
-    "description": "【分段前】清理文本项(仅Simple生效)",
+    "description": "【分段前】清理文本项（列表）。(仅Simple生效)",
     "hint": "在切分之前执行，直接删除填入的准确文本。非常适合新手填入 <think> 或 </think> 进行脱敏。",
     "type": "list",
     "default": []
   },
   "clean_after_items": {
-    "description": "【分段后】清理文本项(仅Simple生效)",
+    "description": "【分段后】清理文本项（列表）。(仅Simple生效)",
     "hint": "在分段完成、发送前执行删除。注意不要误删关键标点。",
     "type": "list",
     "default": []
   },
   "clean_before_regex": {
-    "description": "【分段前】高级清理正则(仅Regex生效)",
+    "description": "【分段前】高级清理正则（文本框）。(仅Regex生效)",
     "hint": "会在切分之前执行！如填写 <think>.*?</think> 将可安全地彻底剥离外置思维链而不受后续切分影响。",
     "type": "string",
     "default": ""
   },
   "clean_after_regex": {
-    "description": "【分段后】高级清理正则(仅Regex生效)",
+    "description": "【分段后】高级清理正则（文本框）。(仅Regex生效)",
     "hint": "在分段完成、发送前对每个被切割好的段落执行清理。",
     "type": "string",
     "default": ""
