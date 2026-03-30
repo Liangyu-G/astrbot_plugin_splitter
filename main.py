@@ -349,23 +349,33 @@ class MessageSplitterPlugin(Star):
             for seg in segments:
                 self._trim_segment_edge_blank_lines(seg)
 
-        # 12. 【分段后清理】：在段落完全确定、准备发送前执行清理
+        # 12. 【分段后清理】：仅清理每段末尾的分隔符，防止误吞正文标点
         if split_mode == "simple":
             clean_after_items = self.config.get("clean_after_items", [])
             if isinstance(clean_after_items, list) and clean_after_items:
                 for seg in segments:
-                    for comp in seg:
+                    # 倒序遍历，只清理该段落最后一段文本的末尾
+                    for comp in reversed(seg):
                         if isinstance(comp, Plain) and comp.text:
                             for item in clean_after_items:
                                 if item:
-                                    comp.text = comp.text.replace(item, "")
+                                    # 加上 \s*$ 锚点，仅匹配末尾（允许带空白符）
+                                    pattern = f"(?:{re.escape(item)})\\s*$"
+                                    comp.text = re.sub(pattern, "", comp.text)
+                            break
         else:
             clean_after_regex = self.config.get("clean_after_regex", "")
             if clean_after_regex:
+                pattern = clean_after_regex
+                # 自动补全 \s*$ 锚点，确保只清理段落末尾
+                if not pattern.endswith("$"):
+                    pattern = f"(?:{pattern})\\s*$"
                 for seg in segments:
-                    for comp in seg:
+                    # 倒序遍历，只清理该段落最后一段文本的末尾
+                    for comp in reversed(seg):
                         if isinstance(comp, Plain) and comp.text:
-                            comp.text = re.sub(clean_after_regex, "", comp.text, flags=re.DOTALL)
+                            comp.text = re.sub(pattern, "", comp.text, flags=re.DOTALL)
+                            break
 
         # 如果只有一段且没做处理，直接交给框架
         clean_before_used = bool(self.config.get("clean_before_items", [])) or bool(self.config.get("clean_before_regex", ""))
@@ -393,15 +403,17 @@ class MessageSplitterPlugin(Star):
                     event, segment_chain
                 )
 
+                # 【延迟逻辑修复】：根据当前段落字数，在发送前进行延迟
+                wait_time = self.calculate_delay(text_content)
+                if wait_time > 0:
+                    await asyncio.sleep(wait_time)
+
                 self._log_segment(i + 1, len(segments), segment_chain, "主动发送")
 
                 # 构建消息链并调用上下文接口发送
                 mc = MessageChain()
                 mc.chain = segment_chain
                 await self.context.send_message(event.unified_msg_origin, mc)
-
-                wait_time = self.calculate_delay(text_content)
-                await asyncio.sleep(wait_time)
 
             except Exception as e:
                 logger.error(f"[Splitter] 发送分段 {i + 1} 失败: {e}")
@@ -416,6 +428,11 @@ class MessageSplitterPlugin(Star):
             if not last_text_for_check and not last_has_media:
                 result.chain.clear()
             else:
+                # 【延迟逻辑修复】：最后一段交给框架前，同样根据其字数进行延迟
+                wait_time = self.calculate_delay(last_text)
+                if wait_time > 0:
+                    await asyncio.sleep(wait_time)
+
                 self._log_segment(
                     len(segments), len(segments), last_segment, "交给框架"
                 )
