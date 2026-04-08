@@ -42,6 +42,18 @@
     "type": "string",
     "default": ""
   },
+  "conversation_blacklist": {
+    "description": "对话黑名单",
+    "hint": "填入 unified_msg_origin (如 aiocqhttp:group_message:123456)，匹配到的对话将不启用分段。",
+    "type": "list",
+    "default": []
+  },
+  "conversation_whitelist": {
+    "description": "对话白名单",
+    "hint": "若不为空，则仅对白名单内的对话启用分段。黑名单优先级更高。",
+    "type": "list",
+    "default": []
+  },
   "enable_group_split": {
     "description": "是否开启群聊分段",
     "hint": "当群组分段导致刷屏时，可关闭该开关，默认开启。",
@@ -66,8 +78,14 @@
     "default": 7
   },
   "max_length_no_split": {
-    "description": "分段字数阈值",
+    "description": "分段字数下限阈值",
     "hint": "少于多少字不执行分段。填 0 禁用此功能。",
+    "type": "int",
+    "default": 0
+  },
+  "max_length_to_disable": {
+    "description": "分段字数上限阈值(启动条件)",
+    "hint": "当文本总长度超过此数值时，完全不启用分段逻辑。填 0 禁用此功能。",
     "type": "int",
     "default": 0
   },
@@ -110,12 +128,6 @@
     "type": "string",
     "options": ["llm_only", "all"],
     "default": "llm_only"
-  },
-  "disable_active_split_on_restricted_platforms": {
-    "description": "在受限平台禁用主动分段发送。",
-    "hint": "开启后，在 qq_official、weixin_official_account、dingtalk 上直接跳过本插件的主动分段发送，避免出现部分分段发送失败",
-    "type": "bool",
-    "default": true
   },
   "image_strategy": {
     "description": "图片组件的分段策略。",
