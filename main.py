@@ -19,24 +19,26 @@ class MessageSplitterPlugin(Star):
         super().__init__(context)
         self.config = config
 
-        # --- 配置兼容性与迁移逻辑 ---
+        # --- 1. 配置兼容性与迁移逻辑 ---
         self._migrate_config()
 
-        # 智能回复：按会话缓存消息 ID
+        # 智能回复：按会话缓存消息 ID，供发送前判断“是否被新消息插嘴”
         self._message_queues = defaultdict(deque)
         self._last_smart_reply_mark = {}
 
-        # 定义成对出现的字符
+        # 定义成对出现的字符，在智能分段时避免在这些符号内部切断
         self.pair_map = {
             '“': '”', "《": "》", "（": "）", "(": ")",
             "[": "]", "{": "}", "‘": "’", "【": "】", "<": ">",
         }
+        # 定义引用/引号字符
         self.quote_chars = {'"', "'", "`"}
         self.secondary_pattern = re.compile(r"[，,、；;]+")
 
     def _get_cfg(self, key: str, default: Any = None) -> Any:
         """
         助手函数：自动从嵌套或扁平结构中获取配置项。
+        解决嵌套配置后代码无法读取旧配置或默认值的问题。
         """
         # 定义分类映射
         categories = [
@@ -53,9 +55,13 @@ class MessageSplitterPlugin(Star):
         return self.config.get(key, default)
 
     def _migrate_config(self):
-        """处理旧版本配置数据类型冲突及嵌套迁移"""
+        """
+        处理旧版本配置数据类型冲突及嵌套迁移。
+        防止用户升级插件后配置“丢失”。
+        """
         # 1. 键名迁移: clean_items -> clean_before_items
         if "clean_items" in self.config and "clean_before_items" not in self.config:
+            logger.info("[Splitter] 迁移旧配置项 clean_items 至 clean_before_items")
             self.config["clean_before_items"] = self.config.pop("clean_items")
 
         # 2. 结构迁移：将顶层的扁平配置移动到嵌套对象中
@@ -71,10 +77,11 @@ class MessageSplitterPlugin(Star):
             if cat not in self.config or not isinstance(self.config[cat], dict):
                 self.config[cat] = {}
             for key in keys:
-                if key in self.config and key != cat: # 避免自己移自己
+                if key in self.config and key != cat:
                     val = self.config.pop(key)
-                    # 特殊处理 split_chars 等列表项，确保不出现嵌套列表
-                    if key in ["split_chars", "clean_before_items", "clean_after_items", "conversation_blacklist", "conversation_whitelist"]:
+                    # 强制类型转换，防止列表配置项变成字符串
+                    list_fields = ["split_chars", "clean_before_items", "clean_after_items", "conversation_blacklist", "conversation_whitelist"]
+                    if key in list_fields:
                         if isinstance(val, str):
                             val = [val] if key != "split_chars" else list(val)
                         elif isinstance(val, list):
@@ -318,8 +325,28 @@ class MessageSplitterPlugin(Star):
         if l_p and l_p.text: l_p.text = re.sub(r'(?:\r?\n[ \t]*)+$', '', l_p.text)
 
     async def _process_tts_for_segment(self, event: AstrMessageEvent, segment: List[BaseMessageComponent]) -> List[BaseMessageComponent]:
-        # 保持原有 TTS 逻辑不变，但使用 _get_cfg
-        return segment # 简化展示，实际逻辑同前
+        if not self._get_cfg("enable_tts_for_segments", True): return segment
+        try:
+            all_cfg = self.context.get_config(event.unified_msg_origin)
+            tts_cfg = all_cfg.get("provider_tts_settings", {})
+            if not tts_cfg.get("enable", False): return segment
+            tts_prov = self.context.get_using_tts_provider(event.unified_msg_origin)
+            if not tts_prov or not await SessionServiceManager.should_process_tts_request(event): return segment
+            if random.random() > float(tts_cfg.get("trigger_probability", 1.0)): return segment
+            dual = tts_cfg.get("dual_output", False)
+            new_seg = []
+            for comp in segment:
+                if isinstance(comp, Plain) and len(comp.text) > 1:
+                    try:
+                        path = await tts_prov.get_audio(comp.text)
+                        if path:
+                            new_seg.append(Record(file=path, url=path))
+                            if dual: new_seg.append(comp)
+                        else: new_seg.append(comp)
+                    except: new_seg.append(comp)
+                else: new_seg.append(comp)
+            return new_seg
+        except: return segment
 
     def calculate_delay(self, text: str) -> float:
         strategy = self._get_cfg("delay_strategy", "linear")
