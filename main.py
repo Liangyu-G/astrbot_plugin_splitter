@@ -252,6 +252,22 @@ class MessageSplitterPlugin(Star):
 
         segments = self.split_chain_smart(result.chain, split_pattern, self._get_cfg("enable_smart_split", True), strategies, self._get_cfg("enable_reply", True), ideal_length)
 
+        # 强制分段上限控制
+        if max_segs > 0 and len(segments) > max_segs:
+            merged_last = []
+            for seg in segments[max_segs - 1:]:
+                merged_last.extend(seg)
+                
+            optimized_last = []
+            # 合并连贯的 Plain 组件避免由于强制合并导致文本内部被打断
+            for comp in merged_last:
+                if optimized_last and isinstance(comp, Plain) and isinstance(optimized_last[-1], Plain):
+                    optimized_last[-1] = Plain(optimized_last[-1].text + comp.text)
+                else:
+                    optimized_last.append(comp)
+                    
+            segments = segments[:max_segs - 1] + [optimized_last]
+
         # 均分模式尾部合并
         if self._get_cfg("balanced_split_mode", False) and len(segments) >= 2:
             last_text = "".join([c.text for c in segments[-1] if isinstance(c, Plain)]).strip()
